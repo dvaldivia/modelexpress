@@ -43,6 +43,7 @@ if _nixl_api is not None:
 
 OBJ_BACKEND = "OBJ"
 OBJ_MEM_TYPE = "OBJ"
+HOST_MEM_TYPE = "DRAM"
 # Reads and slots have no 4 GiB cap. cuObject mints an RDMA token for at most
 # 4 GiB - 64 KiB, but NIXL splits a larger read into ranged GETs of that size.
 # Registering a slot of 4 GiB or more needs the cuObject
@@ -146,6 +147,8 @@ class S3RdmaTransferManager:
         self._num_threads = num_threads
         self._accelerator_backend = accelerator_backend
         self._mem_type = accelerator_backend.nixl_mem_type
+        self._slot_mem_type = self._mem_type
+        self._slot_dev_id = device_id
         self._agent: Any = None
         self._obj_reg: Any = None
         self._slot_reg: Any = None
@@ -208,14 +211,18 @@ class S3RdmaTransferManager:
         self._obj_reg = self._agent.register_memory(regions, OBJ_MEM_TYPE, backends=[OBJ_BACKEND])
         return list(range(len(objects)))
 
-    def register_slots(self, slots: Sequence[torch.Tensor]) -> None:
-        """Register each staging slot as its own device-memory region."""
+    def register_slots(self, slots: Sequence[torch.Tensor], *, host: bool = False) -> None:
+        """Register each staging slot as its own region, in device or host memory."""
         self._require_agent()
         if self._slot_reg is not None:
             raise S3RdmaTransferError("slots are already registered")
         if not slots:
             raise S3RdmaTransferError("no staging slots to register")
-        device = self._accelerator_backend.torch_device(self._device_id)
+        if host:
+            device, mem_type, dev_id = torch.device("cpu"), HOST_MEM_TYPE, 0
+        else:
+            device = self._accelerator_backend.torch_device(self._device_id)
+            mem_type, dev_id = self._mem_type, self._device_id
         regions = []
         for idx, slot in enumerate(slots):
             nbytes = slot.numel() * slot.element_size()
@@ -223,8 +230,12 @@ class S3RdmaTransferManager:
                 raise S3RdmaTransferError(f"staging slot {idx} is on {slot.device}, expected {device}")
             if not slot.is_contiguous():
                 raise S3RdmaTransferError(f"staging slot {idx} is not contiguous")
-            regions.append((slot.data_ptr(), nbytes, self._device_id, ""))
-        self._slot_reg = self._agent.register_memory(regions, self._mem_type, backends=[OBJ_BACKEND])
+            regions.append((slot.data_ptr(), nbytes, dev_id, ""))
+        try:
+            self._slot_reg = self._agent.register_memory(regions, mem_type, backends=[OBJ_BACKEND])
+        except Exception as exc:
+            raise S3RdmaTransferError(f"could not register {mem_type} staging slots: {exc}") from exc
+        self._slot_mem_type, self._slot_dev_id = mem_type, dev_id
         self._slots = list(slots)
 
     def post(self, slot: int, obj_dev_id: int, offset: int, length: int) -> Any:
@@ -239,7 +250,7 @@ class S3RdmaTransferManager:
         if length <= 0 or length > capacity:
             raise S3RdmaTransferError(f"invalid read length {length} for a {capacity}-byte slot")
         local = self._agent.get_xfer_descs(
-            [(slot_tensor.data_ptr(), length, self._device_id)], self._mem_type
+            [(slot_tensor.data_ptr(), length, self._slot_dev_id)], self._slot_mem_type
         )
         remote = self._agent.get_xfer_descs([(offset, length, obj_dev_id)], OBJ_MEM_TYPE)
         try:

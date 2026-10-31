@@ -160,6 +160,31 @@ class TestS3RdmaTransferManager:
         with pytest.raises(S3RdmaTransferError, match="not contiguous"):
             mgr.register_slots([torch.zeros(32, dtype=torch.uint8)[::2]])
 
+    def test_register_host_slots_as_dram(self, manager):
+        mgr, state = manager
+        mgr.initialize()
+        mgr.register_objects([("k0", 100)])
+        with pytest.raises(S3RdmaTransferError, match="is on meta, expected cpu"):
+            mgr.register_slots([torch.zeros(16, dtype=torch.uint8, device="meta")], host=True)
+        mgr.register_slots([torch.zeros(16, dtype=torch.uint8)], host=True)
+        handle = mgr.post(0, 0, 0, 16)
+        while not mgr.poll(handle):
+            pass
+        mgr.release(handle)
+        agent = state["agents"][0]
+        assert ("register", "DRAM", 1) in agent.events
+        assert agent.local_types == [("DRAM", 0)]
+
+    def test_register_slots_reports_nixl_failure(self, fake_nixl, mock_accelerator_backend_cls):
+        fake_nixl({"k0": b"x" * 100}, vram_register_error=RuntimeError("cuMemObjGetDescriptor failed"))
+        mgr = S3RdmaTransferManager(
+            "a", ENDPOINT, device_id=0, num_threads=1, accelerator_backend=mock_accelerator_backend_cls()
+        )
+        mgr.initialize()
+        with pytest.raises(S3RdmaTransferError, match="could not register VRAM staging slots"):
+            mgr.register_slots([torch.zeros(16, dtype=torch.uint8)])
+        mgr.register_slots([torch.zeros(16, dtype=torch.uint8)], host=True)
+
     def test_post_rejects_busy_or_unknown_slot(self, manager):
         mgr, _ = manager
         mgr.initialize()

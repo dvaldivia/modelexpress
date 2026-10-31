@@ -1214,7 +1214,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `refit/` | Engine-agnostic live-refit primitives. `RefitTimingRecorder` provides normalized stage timing; `reshard/` provides loader-observed geometry capture, slice/transfer planning, rendezvous, and transport abstractions |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
-| `s3_rdma_transfer.py` | `S3RdmaTransferManager` - private NIXL agent with the OBJ backend's generic accelerated engine (`x-amz-rdma-token`); posts one-descriptor ranged reads from objects into registered device slots, drains before freeing, and quarantines memory whose reads never finish |
+| `s3_rdma_transfer.py` | `S3RdmaTransferManager` - private NIXL agent with the OBJ backend's generic accelerated engine (`x-amz-rdma-token`); posts one-descriptor ranged reads from objects into registered staging slots in device or pinned host memory, drains before freeing, and quarantines memory whose reads never finish |
 | `s3_rdma_loader.py` | `MxS3RdmaLoader` - resolves an `s3://` checkpoint over HTTP (listing, index, headers), plans object-local windows, streams them over S3-over-RDMA through a fixed pool of staging slots, and copies each window device-to-device into fresh per-tensor allocations with a tail-canary integrity check |
 | `safetensors_header.py` | Safetensors header parsing, dtype map, and checkpoint shard selection shared by the GDS and S3-over-RDMA loaders |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
