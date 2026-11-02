@@ -68,6 +68,7 @@ def run_loads(device, args, barrier):
         threads=args.threads,
         timeout_s=args.timeout,
         verify=args.verify,
+        staging=args.staging,
     )
     runs = []
     for _ in range(args.repeats):
@@ -124,6 +125,7 @@ def main():
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--verify", choices=("tail", "full", "off"), default="tail")
+    parser.add_argument("--staging", choices=("auto", "device", "host"), default="auto")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--metrics", default="", help="comma-separated AIStor base URLs for RDMA counters")
     parser.add_argument("--json-out", default="", help="write the summary JSON to this path")

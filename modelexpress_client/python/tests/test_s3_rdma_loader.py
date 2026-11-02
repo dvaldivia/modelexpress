@@ -96,6 +96,7 @@ class FakeS3RdmaAgent:
         plugins=("OBJ",),
         mem_types=("DRAM_SEG", "VRAM_SEG", "OBJ_SEG"),
         create_error=None,
+        vram_register_error=None,
         fail=(),
         short=(),
         skip=(),
@@ -109,6 +110,7 @@ class FakeS3RdmaAgent:
         self.plugins = list(plugins)
         self.mem_types = list(mem_types)
         self.create_error = create_error
+        self.vram_register_error = vram_register_error
         self.fail, self.short, self.skip, self.stuck = set(fail), set(short), set(skip), set(stuck)
         self.corrupt = set(corrupt)
         self.rng = random.Random(seed)
@@ -120,6 +122,7 @@ class FakeS3RdmaAgent:
         self.handles: list[FakeHandle] = []
         self.posted = 0
         self.events: list[tuple] = []
+        self.local_types: list[tuple[str, int]] = []
 
     def get_plugin_list(self):
         return self.plugins
@@ -136,6 +139,8 @@ class FakeS3RdmaAgent:
     def register_memory(self, regions, mem_type, backends=()):
         assert list(backends) == ["OBJ"]
         assert all(len(region) == 4 for region in regions)
+        if mem_type == "VRAM" and self.vram_register_error is not None:
+            raise self.vram_register_error
         if mem_type == "OBJ":
             for offset, size, dev_id, key in regions:
                 assert offset == 0
@@ -167,9 +172,10 @@ class FakeS3RdmaAgent:
     def initialize_xfer(self, op, local, remote, remote_agent, backends=()):
         assert op == "READ" and remote_agent == self.name and list(backends) == ["OBJ"]
         (local_type, local_descs), (remote_type, remote_descs) = local, remote
-        assert local_type == "VRAM" and remote_type == "OBJ"
+        assert local_type in ("VRAM", "DRAM") and remote_type == "OBJ"
         assert len(local_descs) == 1 and len(remote_descs) == 1
-        (addr, length, _dev), (offset, remote_len, dev_id) = local_descs[0], remote_descs[0]
+        (addr, length, local_dev), (offset, remote_len, dev_id) = local_descs[0], remote_descs[0]
+        self.local_types.append((local_type, local_dev))
         assert length == remote_len
         assert addr in self.slot_regs, "local descriptor must start at a registration base"
         assert length <= self.slot_regs[addr]
@@ -284,8 +290,12 @@ def reference(objects: dict[str, bytes]) -> dict[str, torch.Tensor]:
     return expected
 
 
-def make_loader(backend, objects, *, window=64, inflight=2, verify="tail", timeout=5.0, reader=None):
-    config = S3RdmaLoadConfig(window_bytes=window, inflight=inflight, verify=verify, timeout_s=timeout)
+def make_loader(
+    backend, objects, *, window=64, inflight=2, verify="tail", timeout=5.0, reader=None, staging="auto"
+):
+    config = S3RdmaLoadConfig(
+        window_bytes=window, inflight=inflight, verify=verify, timeout_s=timeout, staging=staging
+    )
     return MxS3RdmaLoader(backend, 0, config, reader=reader or FakeReader(objects), endpoint=ENDPOINT)
 
 
@@ -503,6 +513,59 @@ class TestLoad:
         loaded = dict(load_all(make_loader(mock_accelerator_backend_cls(s3_rdma=True), objects, window=100, inflight=2)))
         assert torch.equal(loaded["huge"], torch.arange(4096, dtype=torch.float32))
 
+    def test_auto_staging_prefers_device_memory(self, fake_nixl, mock_accelerator_backend_cls):
+        objects = make_checkpoint(sample_shards())
+        state = fake_nixl(objects)
+        load_all(make_loader(mock_accelerator_backend_cls(s3_rdma=True), objects))
+        assert {local for local, _dev in state["agents"][0].local_types} == {"VRAM"}
+
+    @pytest.mark.parametrize("staging", ["auto", "host"])
+    def test_host_staging_is_byte_exact(self, fake_nixl, mock_accelerator_backend_cls, staging):
+        objects = make_checkpoint(sample_shards())
+        state = fake_nixl(objects, vram_register_error=RuntimeError("cuMemObjGetDescriptor failed"))
+        backend = mock_accelerator_backend_cls(s3_rdma=True)
+        loaded = load_all(make_loader(backend, objects, inflight=3, staging=staging))
+
+        expected = reference(objects)
+        assert sorted(name for name, _ in loaded) == sorted(expected)
+        for name, tensor in loaded:
+            assert tensor.device == backend.torch_device(0)
+            assert as_bytes(tensor) == as_bytes(expected[name])
+        agent = state["agents"][0]
+        assert set(agent.local_types) == {("DRAM", 0)}
+        assert ("register", "DRAM", 3) in agent.events
+        assert agent.events[-2:] == [("deregister", "DRAM"), ("deregister", "OBJ")]
+        assert not agent.slot_regs and not agent.unreleased()
+
+    def test_host_staging_fences_copies_before_poisoning_a_slot(self, fake_nixl, mock_accelerator_backend_cls):
+        objects = make_checkpoint(sample_shards())
+        fake_nixl(objects)
+        backend = mock_accelerator_backend_cls(s3_rdma=True)
+        loader = make_loader(backend, objects, window=32, inflight=2, staging="host")
+        events = []
+        scatter, poison = loader._scatter, loader._poison_tail
+        loader._scatter = lambda *a: events.append("scatter") or scatter(*a)
+        loader._poison_tail = lambda *a: events.append("poison") or poison(*a)
+        sync = backend.synchronize
+        backend.synchronize = lambda *a: events.append("sync") or sync(*a)
+        load_all(loader)
+        assert "scatter" in events and "poison" in events[events.index("scatter") :]
+        last_scatter = None
+        for idx, event in enumerate(events):
+            if event == "scatter":
+                last_scatter = idx
+            elif event == "poison" and last_scatter is not None:
+                assert "sync" in events[last_scatter:idx]
+
+    def test_device_staging_does_not_fall_back(self, fake_nixl, mock_accelerator_backend_cls):
+        objects = make_checkpoint(sample_shards())
+        state = fake_nixl(objects, vram_register_error=RuntimeError("cuMemObjGetDescriptor failed"))
+        loader = make_loader(mock_accelerator_backend_cls(s3_rdma=True), objects, staging="device")
+        with pytest.raises(S3RdmaTransferError, match="could not register VRAM staging slots"):
+            loader.prepare("s3://models/llama")
+        loader.release()
+        assert not state["agents"][0].local_types
+
 
 class TestFailures:
     def _loader(self, fake_nixl, backend, objects, agent_kwargs, **loader_kwargs):
@@ -649,6 +712,7 @@ class TestS3RdmaLoadConfig:
             {"inflight": 65},
             {"threads": -1},
             {"verify": "sometimes"},
+            {"staging": "pinned"},
         ],
     )
     def test_rejects_invalid(self, kwargs):
@@ -663,10 +727,12 @@ class TestS3RdmaLoadConfig:
         monkeypatch.setenv("MX_S3_RDMA_INFLIGHT", "12")
         monkeypatch.delenv("MX_S3_RDMA_THREADS", raising=False)
         monkeypatch.setenv("MX_S3_RDMA_VERIFY", "off")
+        monkeypatch.setenv("MX_S3_RDMA_STAGING", " Host ")
         config = S3RdmaLoadConfig.from_env()
         assert config.window_bytes == 64 * 1024 * 1024
         assert config.num_threads == 12
         assert config.verify == "off"
+        assert config.staging == "host"
 
 
 class TestReaderFromSession:

@@ -6,10 +6,11 @@ S3-over-RDMA safetensors loader built on NIXL OBJ.
 
 Metadata (listing, index, safetensors headers, integrity canaries) is read
 over plain HTTP with boto3. Tensor payloads are read with ranged S3-over-RDMA
-GETs into a small pool of registered device staging slots, then copied
-device-to-device into fresh per-tensor allocations that are yielded to the
-engine. Yielded tensors never alias the slots, so engines may keep references
-across iterations while the slots are reused.
+GETs into a small pool of registered staging slots, then copied into fresh
+per-tensor device allocations that are yielded to the engine. Slots live in
+device memory, or in pinned host memory when the GPU cannot be registered for
+RDMA (``MX_S3_RDMA_STAGING``). Yielded tensors never alias the slots, so
+engines may keep references across iterations while the slots are reused.
 
 Usage::
 
@@ -58,6 +59,7 @@ from .safetensors_header import (
 logger = logging.getLogger("modelexpress.s3_rdma_loader")
 
 VERIFY_MODES = ("tail", "full", "off")
+STAGING_MODES = ("auto", "device", "host")
 _MIB = 1024 * 1024
 # One ranged GET covers the header of typical shards (tens to hundreds of KiB);
 # a larger header costs one more GET.
@@ -93,6 +95,7 @@ class S3RdmaLoadConfig:
     threads: int = 0
     timeout_s: float = 120.0
     verify: str = "tail"
+    staging: str = "auto"
 
     def __post_init__(self) -> None:
         if self.window_bytes <= 0:
@@ -103,6 +106,8 @@ class S3RdmaLoadConfig:
             raise ValueError(f"threads {self.threads} must be >= 0")
         if self.verify not in VERIFY_MODES:
             raise ValueError(f"verify mode {self.verify!r} must be one of {VERIFY_MODES}")
+        if self.staging not in STAGING_MODES:
+            raise ValueError(f"staging mode {self.staging!r} must be one of {STAGING_MODES}")
 
     @property
     def num_threads(self) -> int:
@@ -116,6 +121,7 @@ class S3RdmaLoadConfig:
             threads=envs.MX_S3_RDMA_THREADS,
             timeout_s=envs.MX_S3_RDMA_TIMEOUT,
             verify=envs.MX_S3_RDMA_VERIFY,
+            staging=envs.MX_S3_RDMA_STAGING,
         )
         if config.num_threads > _AWS_SDK_DEFAULT_CONNECTIONS - 1:
             logger.warning(
@@ -464,6 +470,7 @@ class MxS3RdmaLoader:
         self._finished = False
         self._drain_failed = False
         self._timing: dict[str, float] = {}
+        self._staging = "device"
 
     @property
     def plan(self) -> S3RdmaLoadPlan | None:
@@ -516,9 +523,8 @@ class MxS3RdmaLoader:
         if plan.windows:
             self._fetch_canaries(plan)
             marks["canaries"] = time.perf_counter()
-            self._allocate_slots(plan)
             self._manager.register_objects([(key, size) for key, size, _etag in plan.objects])
-            self._manager.register_slots(self._slots)
+            self._register_slots(plan)
             marks["register"] = time.perf_counter()
             self._prime()
             marks["prime"] = time.perf_counter()
@@ -529,11 +535,13 @@ class MxS3RdmaLoader:
             phases.append(f"{phase}={mark - previous:.2f}s")
             previous = mark
         logger.info(
-            "[TIMING] NIXL OBJ prepare: %d objects, %d tensors, %d windows, %.2f GB in %.2fs (%s)",
+            "[TIMING] NIXL OBJ prepare: %d objects, %d tensors, %d windows, %.2f GB, "
+            "%s staging, in %.2fs (%s)",
             len(plan.objects),
             len(plan.tensors),
             len(plan.windows),
             plan.total_bytes / 1e9,
+            self._staging,
             self._timing["prepare_s"],
             ", ".join(phases),
         )
@@ -560,12 +568,40 @@ class MxS3RdmaLoader:
         table = torch.frombuffer(poison, dtype=torch.uint8).view(len(plan.windows), _CANARY_BYTES)
         self._poison = table.pin_memory() if self._device.type == "cuda" else table
 
-    def _allocate_slots(self, plan: S3RdmaLoadPlan) -> None:
+    def _register_slots(self, plan: S3RdmaLoadPlan) -> None:
+        """Register device staging slots, or pinned host slots if device registration fails."""
+        staging = self._config.staging
+        if staging != "host":
+            self._allocate_slots(plan, host=False)
+            try:
+                self._manager.register_slots(self._slots)
+                self._staging = "device"
+                return
+            except S3RdmaTransferError as exc:
+                if staging == "device":
+                    raise
+                logger.warning(
+                    "NIXL OBJ could not register device staging slots (%s); "
+                    "staging windows in pinned host memory instead",
+                    exc,
+                )
+                self._slots = []
+                self._tail_host = []
+                self._backend.empty_cache()
+        self._allocate_slots(plan, host=True)
+        self._manager.register_slots(self._slots, host=True)
+        self._staging = "host"
+
+    def _allocate_slots(self, plan: S3RdmaLoadPlan, *, host: bool) -> None:
         slot_bytes = max(window.length for window in plan.windows)
         count = min(self._config.inflight, len(plan.windows))
         pin = self._device.type == "cuda"
         for _ in range(count):
-            self._slots.append(torch.empty(slot_bytes, dtype=torch.uint8, device=self._device))
+            if host:
+                slot = torch.empty(slot_bytes, dtype=torch.uint8, pin_memory=pin)
+            else:
+                slot = torch.empty(slot_bytes, dtype=torch.uint8, device=self._device)
+            self._slots.append(slot)
             tail = torch.empty(_CANARY_BYTES, dtype=torch.uint8, pin_memory=pin)
             self._tail_host.append(tail)
         self._free = deque(range(count))
@@ -613,6 +649,10 @@ class MxS3RdmaLoader:
                 self._capture_tail(slot, window)
                 refill = self._next < len(plan.windows)
                 if refill:
+                    if self._staging == "host":
+                        # A poison write to a host slot lands at once, so queued
+                        # copies out of the slot must finish first.
+                        self._fence()
                     self._poison_tail(slot, self._next)
                 self._fence()
                 self._verify(slot, window_idx)
